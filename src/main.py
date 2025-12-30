@@ -11,7 +11,7 @@ import pygame
 # --- CONFIGURAÇÕES ---
 WINDOW_NAME_PART = "Final Fantasy"
 DEBUG_WIDTH = 600
-DEBUG_HEIGHT = 600 # Aumentei pra caber tudo
+DEBUG_HEIGHT = 600
 BG_COLOR = (30, 30, 35)
 
 class FinalFantasyBot:
@@ -21,16 +21,18 @@ class FinalFantasyBot:
         self.target_pos = None
         self.matrix = None
         
-        # --- CONFIGURAÇÃO DE ALINHAMENTO ---
-        # Referência: CANTO DIREITO DO MAPA
-        self.rel_right_x = 1205  # <--- Atualizado conforme pedido
-        self.rel_y = -20         # Ajuste vertical
+        # --- MEMÓRIA DE VISITAÇÃO (O Rastro) ---
+        self.visited_canvas = None # Vai ser uma imagem preta que pintamos de branco
         
-        # Tamanhos (Quadrados)
+        # --- CONFIGURAÇÃO DE ALINHAMENTO ---
+        self.rel_right_x = 1205
+        self.rel_y = -20
+        
+        # Tamanhos
         self.SIZE_BIG = 267     
         self.SIZE_SMALL = 187   
         
-        self.current_map_mode = "MUNDI" # Começa assumindo grande
+        self.current_map_mode = "MUNDI"
 
         self.last_move_time = 0
         self.move_interval = 0.1
@@ -38,8 +40,8 @@ class FinalFantasyBot:
         # Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT))
-        pygame.display.set_caption("CEREBRO DO BOT - FF1")
-        self.font = pygame.font.SysFont("Consolas", 16, bold=True) # Fonte maior
+        pygame.display.set_caption("CEREBRO DO BOT - Visited Mask")
+        self.font = pygame.font.SysFont("Consolas", 16, bold=True)
         self.clock = pygame.time.Clock()
         self.running = True
 
@@ -60,18 +62,10 @@ class FinalFantasyBot:
         return None
 
     def capture_smart_map(self, win_geo):
-        """
-        Captura a área do mapa e decide o tamanho.
-        O mapa é SEMPRE um quadrado.
-        """
-        # 1. Tenta capturar o tamanho GRANDE primeiro (267x267)
-        # O X de inicio é: (Onde termina - 267)
         start_x_relative = self.rel_right_x - self.SIZE_BIG
-        
         abs_top = win_geo["top"] + self.rel_y
         abs_left = win_geo["left"] + start_x_relative
         
-        # --- CLAMPING (Segurança) ---
         monitor_idx = 1 if len(self.sct.monitors) > 1 else 0
         screen_w = self.sct.monitors[monitor_idx]["width"]
         screen_h = self.sct.monitors[monitor_idx]["height"]
@@ -94,41 +88,25 @@ class FinalFantasyBot:
             img = np.array(sct_img)
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             
-            # --- 2. LÓGICA DE COR & REDIMENSIONAMENTO ---
-            # Verifica se é AZUL (Mundi)
             if img.size > 0:
                 avg_color = np.mean(img, axis=(0, 1))
                 blue, green, red = avg_color
-                
-                # É azul predominante?
                 is_blue_map = (blue > red) and (blue > green) and (blue > 40)
                 
                 if is_blue_map:
                     self.current_map_mode = "MUNDI (267px)"
-                    return img # Retorna quadrado 267x267
+                    return img
                 else:
                     self.current_map_mode = "CIDADE (187px)"
-                    
-                    # --- RECORTE PARA QUADRADO MENOR ---
-                    # Se o mapa diminuiu, ele cola na direita (1205).
-                    # Então pegamos os últimos 187 pixels da largura e os primeiros 187 da altura (Top-Right Alignment)
-                    
-                    diff = self.SIZE_BIG - self.SIZE_SMALL # 80 pixels
-                    
-                    # Checagem de segurança pra não cortar array vazio
+                    diff = self.SIZE_BIG - self.SIZE_SMALL
                     if img.shape[0] > self.SIZE_SMALL and img.shape[1] > diff:
-                        # Recorta: [0 até 187 (Altura), 80 até 267 (Largura)]
-                        # Isso garante que pegamos o canto SUPERIOR DIREITO da captura original
                         return img[0:self.SIZE_SMALL, diff:] 
                     else:
                         return img
-
-        except Exception as e:
-            return None
+        except Exception as e: return None
         return None
 
     def detect_dialogue_bubble(self, win_geo):
-        # Detecta diálogo no centro
         cx = win_geo["left"] + (win_geo["width"] // 2) - 200
         cy = win_geo["top"] + (win_geo["height"] // 2) - 250
         if cx < 0: cx = 0
@@ -159,87 +137,77 @@ class FinalFantasyBot:
                 return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
         return None
 
-    def generate_matrix(self, img):
-        if img is None: return None, None
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        # Se for cidade (não azul), a parede não é necessariamente azul.
-        # Mas vamos manter a lógica base por enquanto.
-        mask = cv2.inRange(hsv, np.array([90, 50, 50]), np.array([150, 255, 255]))
-        return (mask > 0).astype(int), mask
+    def update_visited_mask(self, minimap_shape, player_pos):
+        """Atualiza a matriz booleana de visitados (Branco=Visitado, Preto=Não)"""
+        h, w = minimap_shape[:2]
+        
+        # Inicializa ou Reseta se o tamanho do mapa mudou
+        if self.visited_canvas is None or self.visited_canvas.shape != (h, w):
+            self.visited_canvas = np.zeros((h, w), dtype=np.uint8) # Matriz Preta (0)
+            
+        # Marca onde o jogador está (Branco - 255)
+        if player_pos:
+            # Desenha um círculo para ficar mais visível que um pixel único
+            cv2.circle(self.visited_canvas, player_pos, 4, 255, -1)
+            
+        return self.visited_canvas
 
     def handle_calibration_input(self):
         keys = pygame.key.get_pressed()
         speed = 5 if (keys[pygame.K_LSHIFT]) else 1
-        
-        # Ajusta o PONTO FINAL (1205)
         if keys[pygame.K_LEFT]:  self.rel_right_x -= speed
         if keys[pygame.K_RIGHT]: self.rel_right_x += speed
-        
-        # Ajusta Y
         if keys[pygame.K_UP]:    self.rel_y -= speed
         if keys[pygame.K_DOWN]:  self.rel_y += speed
 
-    def draw_dashboard(self, minimap, mask_debug, status_text, is_dialogue=False):
+    def draw_dashboard(self, minimap, visited_mask, status_text, is_dialogue=False):
         for event in pygame.event.get():
             if event.type == pygame.QUIT: self.running = False
-            if event.type == pygame.MOUSEBUTTONDOWN and self.matrix is not None:
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                # Clique do mouse para definir objetivo
                 mx, my = pygame.mouse.get_pos()
-                # Clique relativo à posição da imagem (que começa em 20, 80)
-                # Como a imagem muda de tamanho, o clique tem que acompanhar
                 current_w = minimap.shape[1] if minimap is not None else self.SIZE_BIG
-                
+                # Ajusta para clicar na imagem da esquerda (Visão Câmera)
                 rx, ry = mx - 20, my - 80
                 if 0 <= rx < current_w and 0 <= ry < current_w:
                     self.target_pos = (rx, ry)
 
         self.screen.fill(BG_COLOR)
         
-        # --- DESENHO DO MINIMAPA (REDIMENSIONA VISUALMENTE) ---
-        current_h = 0
+        # 1. MINIMAPA (Esquerda)
         if minimap is not None:
-            # Converte BGR -> RGB e Transpõe
             rgb = cv2.cvtColor(minimap, cv2.COLOR_BGR2RGB)
             rgb = np.transpose(rgb, (1, 0, 2))
             surf = pygame.surfarray.make_surface(rgb)
-            
-            # ATENÇÃO: Aqui desenhamos 1:1. 
-            # Se for 267, desenha 267. Se for 187, desenha 187.
             self.screen.blit(surf, (20, 80))
-            
-            # Desenha borda no tamanho exato da imagem atual
             current_w = minimap.shape[1]
             current_h = minimap.shape[0]
             pygame.draw.rect(self.screen, (255, 255, 255), (20, 80, current_w, current_h), 2)
-            
-            # Texto indicando o tamanho visual
-            dim_text = f"Tam: {current_w}x{current_h}"
-            self.screen.blit(self.font.render(dim_text, True, (200, 200, 200)), (20, 60))
+            self.screen.blit(self.font.render(f"Câmera ({current_w}x{current_h})", True, (200, 200, 200)), (20, 60))
 
-        # --- DESENHO DA MATRIZ (Lado a Lado) ---
-        if mask_debug is not None:
-            mask_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2RGB)
-            mask_rgb = np.transpose(mask_rgb, (1, 0, 2))
-            surf_m = pygame.surfarray.make_surface(mask_rgb)
+        # 2. MATRIZ DE VISITADOS (Direita - Substitui a Visão Lógica)
+        if visited_mask is not None:
+            # O canvas é grayscale (1 canal), precisamos converter pra RGB pro Pygame
+            v_rgb = cv2.cvtColor(visited_mask, cv2.COLOR_GRAY2RGB)
+            v_rgb = np.transpose(v_rgb, (1, 0, 2))
+            surf_v = pygame.surfarray.make_surface(v_rgb)
             
-            # Desenha a matriz ao lado do mapa
             offset_x = 20 + (minimap.shape[1] if minimap is not None else 270) + 20
-            self.screen.blit(surf_m, (offset_x, 80))
-            pygame.draw.rect(self.screen, (0, 255, 255), (offset_x, 80, mask_debug.shape[1], mask_debug.shape[0]), 1)
-            self.screen.blit(self.font.render("Visão Lógica", True, (0, 255, 255)), (offset_x, 60))
+            self.screen.blit(surf_v, (offset_x, 80))
+            pygame.draw.rect(self.screen, (0, 255, 0), (offset_x, 80, visited_mask.shape[1], visited_mask.shape[0]), 1)
+            
+            # Título atualizado
+            self.screen.blit(self.font.render("Matriz Visitados (Rastro)", True, (0, 255, 0)), (offset_x, 60))
 
-        # --- COORDENADAS E STATUS (Bem visível) ---
+        # STATUS
         c = (255, 50, 50) if is_dialogue else (0, 255, 0)
         self.screen.blit(self.font.render(f"STATUS: {status_text}", True, c), (20, 20))
         
-        # COORDENADAS CRÍTICAS
-        coord_color = (255, 255, 0)
-        coords_str = f"X_FIM (Setas): {self.rel_right_x} | Y_TOPO: {self.rel_y}"
-        self.screen.blit(self.font.render(coords_str, True, coord_color), (20, 400))
-        
-        mode_color = (100, 200, 255) if "MUNDI" in self.current_map_mode else (255, 180, 100)
-        self.screen.blit(self.font.render(f"MODO: {self.current_map_mode}", True, mode_color), (20, 430))
-
+        coords_str = f"X_FIM: {self.rel_right_x} | Y_TOPO: {self.rel_y}"
+        self.screen.blit(self.font.render(coords_str, True, (255, 255, 0)), (20, 400))
+        self.screen.blit(self.font.render(f"MODO: {self.current_map_mode}", True, (100, 200, 255)), (20, 430))
         self.screen.blit(self.font.render(f"Target: {self.target_pos}", True, (255, 0, 255)), (20, 460))
+        
         pygame.display.flip()
 
     def get_move(self):
@@ -249,7 +217,7 @@ class FinalFantasyBot:
         return ('right' if dx > 0 else 'left') if abs(dx) > abs(dy) else ('down' if dy > 0 else 'up')
 
     def run(self):
-        print("🎮 BOT RODANDO - Coordenadas visíveis no painel!")
+        print("🎮 BOT RODANDO - Matriz de Visitados Ativa!")
         while self.running:
             self.handle_calibration_input()
             win = self.get_window_geometry()
@@ -263,7 +231,9 @@ class FinalFantasyBot:
             if minimap is None: continue
 
             self.current_pos = self.find_player(minimap)
-            self.matrix, mask_debug = self.generate_matrix(minimap)
+            
+            # ATUALIZA A MATRIZ DE VISITADOS
+            visited_mask = self.update_visited_mask(minimap.shape, self.current_pos)
             
             if self.current_pos: cv2.circle(minimap, self.current_pos, 5, (0, 255, 0), -1)
             if self.target_pos: cv2.circle(minimap, self.target_pos, 5, (255, 0, 255), -1)
@@ -277,7 +247,8 @@ class FinalFantasyBot:
                     pyautogui.keyDown(move); time.sleep(0.05); pyautogui.keyUp(move)
                     self.last_move_time = time.time()
 
-            self.draw_dashboard(minimap, mask_debug, "DIALOGO" if is_chat else "RODANDO", is_chat)
+            # Passa a visited_mask para desenhar em vez da debug mask antiga
+            self.draw_dashboard(minimap, visited_mask, "DIALOGO" if is_chat else "RODANDO", is_chat)
             self.clock.tick(30)
         pygame.quit()
 

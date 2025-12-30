@@ -12,11 +12,16 @@ import hashlib
 # --- CONFIGURAÇÕES ---
 WINDOW_NAME_PART = "Final Fantasy"
 DEBUG_WIDTH = 1000
-DEBUG_HEIGHT = 650
+DEBUG_HEIGHT = 700
 BG_COLOR = (30, 30, 35)
 
-# Sensibilidade da troca de mapa (0.0 a 1.0)
-# Se a similaridade for menor que 0.65, considera que mudou de mapa
+# --- CONFIGURAÇÕES DE TECLAS ---
+KEY_SQUARE = 'v' # Ajuste aqui qual tecla do teclado é o Quadrado
+KEY_CONFIRM = 'enter'
+
+# --- CORES E LIMIARES ---
+TARGET_CITY_BGR = np.array([148, 203, 244], dtype=np.float32)
+CITY_COLOR_THRESHOLD = 60.0 
 MAP_CHANGE_THRESHOLD = 0.65 
 
 class FinalFantasyBot:
@@ -29,12 +34,9 @@ class FinalFantasyBot:
         self.SIZE_BIG = 267     
         self.SIZE_SMALL = 187   
         
-        # --- MEMÓRIA DE MAPAS ---
-        # { 'HASH_DA_ASSINATURA': Matriz_Numpy }
+        # --- MEMÓRIA ---
         self.maps_memory = {} 
         self.current_map_id = None 
-        
-        # Assinatura visual do mapa atual (Histograma)
         self.current_map_signature = None
         
         # --- CANVAS ---
@@ -49,24 +51,24 @@ class FinalFantasyBot:
         self.world_y = 0
 
         # --- ESTADO ---
-        self.current_map_mode = "MUNDI" # MUNDI ou CIDADE
+        self.current_map_mode = "MUNDI"
         self.last_map_frame = None
         self.current_pos = None
         self.debug_similarity = 1.0
+        self.debug_color_dist = 0.0
+        self.in_battle = False
         
         # Navegação
         self.current_direction = 'down' 
         self.stuck_counter = 0
         self.failed_directions = [] 
         self.last_move_time = 0
-        
-        # Buffer para confirmar mudança de mapa (evita piscar em loading)
         self.map_change_stability_counter = 0
 
         # Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT))
-        pygame.display.set_caption("CEREBRO DO BOT - Visual Signature")
+        pygame.display.set_caption("CEREBRO DO BOT - Auto Battle")
         self.font = pygame.font.SysFont("Consolas", 14, bold=True)
         self.clock = pygame.time.Clock()
         self.running = True
@@ -88,105 +90,135 @@ class FinalFantasyBot:
         return None
 
     def release_all_keys(self):
-        for k in ['up', 'down', 'left', 'right', 'enter']:
+        for k in ['up', 'down', 'left', 'right', 'enter', KEY_SQUARE]:
             pyautogui.keyUp(k)
 
+    def check_battle_state(self, win_geo):
+        """
+        Verifica se entrou em batalha olhando a região azul do menu.
+        Coords: 75,565 até 266,696 (Relativo à janela)
+        """
+        rel_x1, rel_y1 = 75, 565
+        rel_x2, rel_y2 = 266, 696
+        w = rel_x2 - rel_x1
+        h = rel_y2 - rel_y1
+        
+        region = {
+            "top": int(win_geo["top"] + rel_y1), 
+            "left": int(win_geo["left"] + rel_x1), 
+            "width": int(w), "height": int(h)
+        }
+        
+        try:
+            sct_img = self.sct.grab(region)
+            img = np.array(sct_img)
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            # Média de cor
+            if img_bgr.size > 0:
+                avg_bgr = np.mean(img_bgr, axis=(0, 1))
+                blue, green, red = avg_bgr
+                
+                # Critério de Menu de Batalha (Azul Escuro Clássico FF)
+                # Geralmente B é alto, R é baixo.
+                is_battle_menu = (blue > 100) and (blue > red + 40) and (blue > green + 10)
+                
+                return is_battle_menu
+        except: pass
+        return False
+
+    def handle_battle(self, win_geo):
+        """
+        Rotina de Batalha:
+        1. Aperta Quadrado (Auto Battle / Skill) UMA VEZ.
+        2. Spama Enter até o menu azul sumir.
+        """
+        print("⚔️ BATALHA INICIADA!")
+        self.in_battle = True
+        self.release_all_keys()
+        
+        # 1. Aperta Quadrado (Uma vez)
+        pyautogui.press(KEY_SQUARE)
+        time.sleep(0.5) 
+        
+        # 2. Loop de Spam Enter
+        while True:
+            # Verifica se ainda tem foco
+            win = self.get_window_geometry()
+            if not win: break
+            
+            # Verifica se a batalha acabou (Menu azul sumiu)
+            if not self.check_battle_state(win):
+                print("🏁 Batalha Finalizada.")
+                break
+                
+            pyautogui.press(KEY_CONFIRM)
+            
+            # Feedback Visual
+            self.draw_dashboard(None, "EM COMBATE (Spam Enter)")
+            self.clock.tick(10) # 10 clicks por segundo
+            
+        self.in_battle = False
+        # Pequeno delay pós-batalha pra recuperar o fôlego
+        time.sleep(1.0)
+
+    # ... (Resto das funções auxiliares mantidas: signatures, detect, etc) ...
     def get_visual_signature(self, img):
-        """
-        Gera uma assinatura única (Histograma de Cores) para o mapa atual.
-        Isso identifica o 'jeitão' do lugar (Floresta, Caverna, Gelo)
-        """
-        # Converte para HSV (Melhor para separar cores de brilho)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        
-        # Calcula histograma 3D (Hue, Saturation) - Ignora Value (Brilho) para robustez
-        # 50 bins para Hue, 60 para Saturation
         hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
-        
-        # Normaliza para poder comparar
         cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
         return hist
 
     def compare_signatures(self, hist1, hist2):
-        """Retorna quão parecidos são dois mapas (0.0 a 1.0)"""
         if hist1 is None or hist2 is None: return 0.0
-        # Correlation: 1.0 = Idêntico, 0.0 = Nada a ver
         return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
 
+    def classify_map_type(self, img):
+        if img is None or img.size == 0: return "CIDADE"
+        avg_bgr = np.mean(img, axis=(0, 1)).astype(np.float32)
+        blue, green, red = avg_bgr
+        dist_city = np.linalg.norm(avg_bgr - TARGET_CITY_BGR)
+        self.debug_color_dist = dist_city
+        if dist_city < CITY_COLOR_THRESHOLD: return "CIDADE"
+        if (blue > red + 40) and (blue > green + 20) and (blue > 60): return "MUNDI"
+        return "CIDADE"
+
     def check_smart_map_change(self, current_img):
-        """
-        Lógica Central: Detecta se o mapa mudou drasticamente.
-        """
         if self.current_map_signature is None:
-            # Primeiro frame do bot
             self.current_map_signature = self.get_visual_signature(current_img)
-            # Gera um ID inicial baseado na imagem
             self.current_map_id = hashlib.md5(current_img.tobytes()).hexdigest()[:8]
+            self.current_map_mode = self.classify_map_type(current_img)
             return False
 
-        # 1. Calcula assinatura do frame atual
         new_sig = self.get_visual_signature(current_img)
-        
-        # 2. Compara com a assinatura do mapa que achamos que estamos
         similarity = self.compare_signatures(self.current_map_signature, new_sig)
-        self.debug_similarity = similarity # Para exibir na tela
+        self.debug_similarity = similarity
 
-        # 3. Lógica de Detecção
-        # Se a similaridade cair muito, PROVAVELMENTE mudou de mapa
         if similarity < MAP_CHANGE_THRESHOLD:
             self.map_change_stability_counter += 1
         else:
-            self.map_change_stability_counter = 0 # Falso alarme, é só movimento
-            
-            # ATUALIZAÇÃO ADAPTATIVA:
-            # Como o mapa muda "levemente" quando anda, atualizamos a assinatura de referência
-            # devagarzinho para o bot não se perder se o bioma mudar gradualmente.
-            # (Weighted average do histograma antigo com o novo)
+            self.map_change_stability_counter = 0
             cv2.accumulateWeighted(new_sig, self.current_map_signature, 0.1)
 
-        # 4. Confirmação (Precisa de 5 frames ruins seguidos pra confirmar troca)
-        # Isso evita trigger em fade-outs rápidos ou glitchs
         if self.map_change_stability_counter > 5:
-            print(f"🌍 MUDANÇA CONFIRMADA! Similaridade: {similarity:.2f}")
-            
-            # --- SALVA O MAPA ANTIGO ---
+            print(f"🌍 MUDANÇA VISUAL! Sim: {similarity:.2f}")
             if self.current_map_id and self.current_map_mode == "CIDADE":
                 self.maps_memory[self.current_map_id] = self.town_canvas.copy()
-                print("💾 Mapa anterior salvo.")
-
-            # --- PREPARA NOVO MAPA ---
-            # Gera ID novo baseado no visual atual
+            
+            new_mode = self.classify_map_type(current_img)
             new_id = hashlib.md5(current_img.tobytes()).hexdigest()[:8]
-            
-            # Tenta recuperar da memória (se já viemos aqui antes)
-            # Nota: Como o hash é exato da imagem, pode ser difícil bater se spawnar em lugar diferente.
-            # O ideal seria comparar histogramas com o banco de dados, mas vamos manter simples por hash.
-            
-            # Reseta estado
             self.town_canvas = np.zeros((self.TOWN_SIZE, self.TOWN_SIZE), dtype=np.uint8)
             self.town_x = self.TOWN_SIZE // 2
             self.town_y = self.TOWN_SIZE // 2
-            
-            # Verifica se é MUNDI ou CIDADE (Lógica de cor média simples)
-            avg = np.mean(current_img, axis=(0,1))
-            if avg[0] > avg[2] and avg[0] > 50: # Muito Azul
-                self.current_map_mode = "MUNDI"
-            else:
-                self.current_map_mode = "CIDADE"
-
-            # Atualiza referências
+            self.current_map_mode = new_mode
             self.current_map_id = new_id
             self.current_map_signature = new_sig
             self.map_change_stability_counter = 0
-            
-            # Pausa para estabilizar
             time.sleep(1.0)
             return True
-            
         return False
 
     def capture_smart_map(self, win_geo):
-        # ... (Captura padrão mantida) ...
         start_x_relative = self.rel_right_x - self.SIZE_BIG
         abs_top = win_geo["top"] + self.rel_y
         abs_left = win_geo["left"] + start_x_relative
@@ -204,11 +236,7 @@ class FinalFantasyBot:
             sct_img = self.sct.grab(region)
             img = np.array(sct_img)
             img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            
-            # Detecção de Tamanho para corte
             if img_bgr.size > 0:
-                # Se estamos em modo CIDADE, corta. Se MUNDI, não corta.
-                # A decisão de modo agora é feita no check_smart_map_change
                 if self.current_map_mode == "CIDADE":
                     diff = self.SIZE_BIG - self.SIZE_SMALL
                     if img_bgr.shape[0] > self.SIZE_SMALL:
@@ -218,7 +246,6 @@ class FinalFantasyBot:
         return None
 
     def detect_movement(self, frame):
-        # Lógica de movimento físico (SLAM simples)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         moved = False
         if self.last_map_frame is not None and self.last_map_frame.shape == gray.shape:
@@ -240,14 +267,12 @@ class FinalFantasyBot:
                 self.world_x = max(0, min(self.world_x, self.WORLD_SIZE - 1))
                 self.world_y = max(0, min(self.world_y, self.WORLD_SIZE - 1))
                 cv2.circle(self.world_canvas, (self.world_x, self.world_y), 2, 255, -1)
-
         elif self.current_map_mode == "CIDADE" and moved:
             dx, dy = 0, 0
             if direction == 'up': dy = -1
             elif direction == 'down': dy = 1
             elif direction == 'left': dx = -1
             elif direction == 'right': dx = 1
-            
             self.town_x += dx
             self.town_y += dy
             self.town_x = max(0, min(self.town_x, self.TOWN_SIZE - 1))
@@ -263,7 +288,6 @@ class FinalFantasyBot:
         return random.choice(valid)
 
     def detect_dialogue_bubble(self, win_geo):
-        # Lógica de dialogo
         cx = win_geo["left"] + (win_geo["width"] // 2) - 200
         cy = win_geo["top"] + (win_geo["height"] // 2) - 250
         if cx < 0: cx = 0; 
@@ -315,7 +339,6 @@ class FinalFantasyBot:
             pygame.draw.rect(self.screen, (255, 255, 255), (20, 80, minimap.shape[1], minimap.shape[0]), 2)
             self.screen.blit(self.font.render(f"Visão ({minimap.shape[1]}px)", True, (200, 200, 200)), (20, 60))
 
-        # Mapa Lógico
         off_x = 350
         preview_size = 300
         
@@ -326,7 +349,7 @@ class FinalFantasyBot:
             surf_map = pygame.transform.scale(surf_map, (preview_size, preview_size))
             self.screen.blit(surf_map, (off_x, 80))
             pygame.draw.rect(self.screen, (0, 255, 0), (off_x, 80, preview_size, preview_size), 1)
-            header = f"CIDADE - ID: {self.current_map_id}"
+            header = f"CIDADE ID: {self.current_map_id}"
         else: 
             canvas_rgb = cv2.cvtColor(self.world_canvas, cv2.COLOR_GRAY2RGB)
             cv2.circle(canvas_rgb, (self.world_x, self.world_y), 5, (0, 0, 255), -1)
@@ -337,19 +360,19 @@ class FinalFantasyBot:
 
         self.screen.blit(self.font.render(header, True, (0, 255, 255)), (off_x, 60))
 
-        c = (0, 255, 0) if "ANDANDO" in status_text else (255, 50, 50)
+        c = (255, 50, 50) if "COMBATE" in status_text or "DIALOGO" in status_text else (0, 255, 0)
         self.screen.blit(self.font.render(f"STATUS: {status_text}", True, c), (20, 20))
         
-        # MOSTRADOR DE SIMILARIDADE VISUAL
         sim_pct = int(self.debug_similarity * 100)
         sim_color = (0, 255, 0) if self.debug_similarity > MAP_CHANGE_THRESHOLD else (255, 0, 0)
-        self.screen.blit(self.font.render(f"Visual Match: {sim_pct}%", True, sim_color), (20, 400))
-        self.screen.blit(self.font.render(f"Threshold de Troca: {int(MAP_CHANGE_THRESHOLD*100)}%", True, (150, 150, 150)), (20, 420))
+        self.screen.blit(self.font.render(f"Sim Vis: {sim_pct}%", True, sim_color), (20, 400))
+        dist_color = (0, 255, 0) if self.debug_color_dist < CITY_COLOR_THRESHOLD else (255, 0, 0)
+        self.screen.blit(self.font.render(f"Cor Bege Dist: {self.debug_color_dist:.1f}", True, dist_color), (20, 430))
 
         pygame.display.flip()
 
     def run(self):
-        print("🎮 BOT RODANDO - Detector de Assinatura Visual")
+        print("🎮 BOT RODANDO - Modo Batalha Ativo")
         while self.running:
             self.handle_calibration_input()
             win = self.get_window_geometry()
@@ -359,18 +382,17 @@ class FinalFantasyBot:
                 time.sleep(0.5)
                 continue
 
-            # Captura a imagem CRUA (tamanho grande) para análise de assinatura
-            raw_minimap = self.capture_smart_map(win)
-            
-            # Se for None, ou tela preta de fade
-            if raw_minimap is None or np.mean(raw_minimap) < 10: 
-                # Tela preta = transição ou loading. Não faz nada.
+            # CHECK DE BATALHA (PRIORIDADE ALTA)
+            if self.check_battle_state(win):
+                self.handle_battle(win)
                 continue
 
-            # VERIFICA SE O MAPA MUDOU PELA ASSINATURA VISUAL
+            raw_minimap = self.capture_smart_map(win)
+            if raw_minimap is None or np.mean(raw_minimap) < 10: 
+                continue
+
             if self.check_smart_map_change(raw_minimap):
                 self.release_all_keys()
-                # O check já fez o sleep e reset
                 continue
 
             self.current_pos = self.find_player(raw_minimap)
@@ -392,16 +414,21 @@ class FinalFantasyBot:
                 if not current_win:
                     self.release_all_keys()
                     break
+                
+                # Check de Batalha no meio do andar
+                if self.check_battle_state(current_win):
+                    self.release_all_keys()
+                    # Sai do loop de movimento, o próximo loop principal vai tratar a batalha
+                    break 
+
+                if self.check_smart_map_change(current_win):
+                    self.release_all_keys()
+                    break 
 
                 current_minimap = self.capture_smart_map(current_win)
                 if current_minimap is None: 
                     self.release_all_keys()
                     break
-                
-                # Check de transição DURANTE movimento
-                if self.check_smart_map_change(current_minimap):
-                    self.release_all_keys()
-                    break 
 
                 self.current_pos = self.find_player(current_minimap)
                 frame_moved = self.detect_movement(current_minimap)

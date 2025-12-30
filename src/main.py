@@ -8,11 +8,11 @@ import subprocess
 import re
 import pygame
 
-# --- CONFIGURAÇÕES GERAIS ---
-WINDOW_NAME_PART = "Final Fantasy"
+# --- CONFIGURAÇÕES ---
 DEBUG_WIDTH = 800
-DEBUG_HEIGHT = 450 # Aumentei um pouco
+DEBUG_HEIGHT = 450
 BG_COLOR = (20, 20, 20)
+WINDOW_NAME_PART = "Final Fantasy"
 
 class FinalFantasyBot:
     def __init__(self):
@@ -21,20 +21,24 @@ class FinalFantasyBot:
         self.target_pos = None
         self.matrix = None
         
-        # --- COORDENADAS DINÂMICAS (Para ajuste ao vivo) ---
-        # Começando com o seu chute inicial
-        self.map_x = 949
-        self.map_y = 36
-        self.map_w = 267
-        self.map_h = 267
+        # --- CONFIGURAÇÃO INICIAL (Ajuste Fino) ---
+        # "X tem que diminuir": Se 1215 for muito para a direita, 
+        # use as setas para reduzir esse valor na hora.
+        self.map_offset_x = 1215 
+        self.map_offset_y = -20  
+        
+        # Tamanhos Padrão
+        self.SIZE_BIG = 267   # Mapa Mundi (Azul)
+        self.SIZE_SMALL = 187 # Cidade (Bege)
+        self.current_size = self.SIZE_BIG # Começa assumindo grande
         
         self.last_move_time = 0
         self.move_interval = 0.1
 
-        # --- PYGAME SETUP ---
+        # Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT))
-        pygame.display.set_caption("CEREBRO DO BOT - Calibracao Manual")
+        pygame.display.set_caption("CEREBRO DO BOT - Auto Size")
         self.font = pygame.font.SysFont("Consolas", 14, bold=True)
         self.clock = pygame.time.Clock()
         self.running = True
@@ -55,29 +59,88 @@ class FinalFantasyBot:
         except: pass
         return None
 
-    def capture_minimap(self, win_geo):
-        # Captura a janela inteira primeiro
-        full_img = np.array(self.sct.grab(win_geo))
-        full_img = cv2.cvtColor(full_img, cv2.COLOR_BGRA2BGR)
+    def capture_and_resize(self, win_geo):
+        """
+        Versão BLINDADA: Impede que o MSS tente capturar pixels fora do monitor
+        (o que causa o erro XGetImage failed).
+        """
+        # 1. Calcula as coordenadas ideais
+        top = win_geo["top"] + self.map_offset_y
+        left = win_geo["left"] + self.map_offset_x
+        width = self.SIZE_BIG
+        height = self.SIZE_BIG
         
-        h, w, _ = full_img.shape
-        
-        # Usa as variáveis da classe (que vamos mudar com teclado)
-        x, y = self.map_x, self.map_y
-        w_rect, h_rect = self.map_w, self.map_h
-        
-        # Validação simples para não crashar se sair da tela
-        if x < 0: self.map_x = 0
-        if y < 0: self.map_y = 0
-        if x + w_rect > w: w_rect = w - x
-        if y + h_rect > h: h_rect = h - y
-        
-        crop = full_img[y:y+h_rect, x:x+w_rect]
-        return crop
+        # 2. Obtém limites do monitor principal (Monitor 1)
+        # sct.monitors[0] é "todos juntos", monitors[1] é o principal.
+        # Vamos assumir o monitor 1 para segurança.
+        screen_w = self.sct.monitors[1]["width"]
+        screen_h = self.sct.monitors[1]["height"]
 
+        # 3. CLAMPING (Segurança)
+        # Se for negativo, vira 0.
+        if top < 0: top = 0
+        if left < 0: left = 0
+        
+        # Se estourar a largura/altura da tela, ajusta o tamanho
+        if left + width > screen_w:
+            width = screen_w - left
+        if top + height > screen_h:
+            height = screen_h - top
+            
+        # Se o ajuste deixou a janela com tamanho inválido (<=0), aborta
+        if width <= 0 or height <= 0:
+            return None
+
+        # 4. Monta o dicionário seguro
+        monitor = {
+            "top": int(top),
+            "left": int(left),
+            "width": int(width),
+            "height": int(height)
+        }
+
+        try:
+            sct_img = self.sct.grab(monitor)
+            img = np.array(sct_img)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            # --- DETECÇÃO DE TAMANHO (Mantida) ---
+            h_img, w_img, _ = img.shape
+            
+            # Se a imagem for muito pequena (cortada pela borda), nem tenta analisar
+            if h_img < 50 or w_img < 50: return img
+
+            # Pega amostra do centro (cuidado com limites de novo)
+            cy, cx = h_img // 2, w_img // 2
+            center_sample = img[max(0, cy-20):min(h_img, cy+20), max(0, cx-20):min(w_img, cx+20)]
+            
+            if center_sample.size > 0:
+                avg_color = np.mean(center_sample, axis=(0, 1))
+                blue, green, red = avg_color
+                
+                # Lógica Azul vs Bege
+                is_blue_map = (blue > red) and (blue > 50)
+                
+                if is_blue_map:
+                    self.current_size = self.SIZE_BIG
+                    return img
+                else:
+                    self.current_size = self.SIZE_SMALL
+                    # Recorte de segurança
+                    crop_h = min(self.SIZE_SMALL, h_img)
+                    crop_w = min(self.SIZE_SMALL, w_img)
+                    return img[0:crop_h, 0:crop_w]
+            
+            return img
+
+        except mss.exception.ScreenShotError:
+            print("⚠️ ERRO MSS: Tentou capturar fora da tela! Ajuste a janela do jogo.")
+            return None
+        
     def find_player(self, img):
-        if img.size == 0: return None
+        if img is None or img.size == 0: return None
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # Range vermelho da seta
         mask1 = cv2.inRange(hsv, np.array([0, 150, 100]), np.array([10, 255, 255]))
         mask2 = cv2.inRange(hsv, np.array([170, 150, 100]), np.array([180, 255, 255]))
         mask = mask1 + mask2
@@ -90,51 +153,44 @@ class FinalFantasyBot:
         return None
 
     def generate_matrix(self, img):
-        if img.size == 0: return None, None
+        if img is None or img.size == 0: return None, None
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_blue = np.array([90, 50, 50])
-        upper_blue = np.array([150, 255, 255])
-        mask_water = cv2.inRange(hsv, lower_blue, upper_blue)
-        matrix = (mask_water > 0).astype(int)
-        return matrix, mask_water
+        
+        # Se estamos no mapa PEQUENO (Bege), a parede geralmente é escura ou contorno
+        # Se estamos no mapa GRANDE (Azul), a parede é o mar (azul)
+        
+        if self.current_size == self.SIZE_BIG:
+            # Lógica Mar (Azul é parede)
+            lower = np.array([90, 50, 50])
+            upper = np.array([150, 255, 255])
+        else:
+            # Lógica Cidade (Bege) - Aqui é mais chato, vamos assumir
+            # que o que for MUITO escuro é obstáculo ou o que for verde é chão?
+            # Por enquanto usando a mesma lógica pra testar visualmente
+            lower = np.array([0, 0, 0]) # Placeholder
+            upper = np.array([180, 255, 30]) # Coisas escuras
+            
+        mask = cv2.inRange(hsv, lower, upper)
+        matrix = (mask > 0).astype(int)
+        return matrix, mask
 
-    def handle_calibration_input(self):
-        """Mágica da Calibração: Teclado controla a área de captura"""
+    def handle_input(self):
         keys = pygame.key.get_pressed()
-        changed = False
-        
-        # SETAS = Movem a Posição (X, Y)
-        if keys[pygame.K_LEFT]:  self.map_x -= 1; changed = True
-        if keys[pygame.K_RIGHT]: self.map_x += 1; changed = True
-        if keys[pygame.K_UP]:    self.map_y -= 1; changed = True
-        if keys[pygame.K_DOWN]:  self.map_y += 1; changed = True
-        
-        # WASD = Redimensionam (Largura, Altura)
-        if keys[pygame.K_d]: self.map_w += 1; changed = True
-        if keys[pygame.K_a]: self.map_w -= 1; changed = True
-        if keys[pygame.K_s]: self.map_h += 1; changed = True
-        if keys[pygame.K_w]: self.map_h -= 1; changed = True
-        
-        if changed:
-            print(f"🔧 AJUSTE: X={self.map_x}, Y={self.map_y}, W={self.map_w}, H={self.map_h}")
+        speed = 5 if (keys[pygame.K_LSHIFT]) else 1
 
-    def draw_dashboard(self, minimap, mask_debug, status_text):
+        # Calibração Manual do Offset X/Y
+        if keys[pygame.K_LEFT]:  self.map_offset_x -= speed
+        if keys[pygame.K_RIGHT]: self.map_offset_x += speed
+        if keys[pygame.K_UP]:    self.map_offset_y -= speed
+        if keys[pygame.K_DOWN]:  self.map_offset_y += speed
+
+    def draw_dashboard(self, minimap, mask_debug):
         for event in pygame.event.get():
             if event.type == pygame.QUIT: self.running = False
-            # Clique define objetivo
-            if event.type == pygame.MOUSEBUTTONDOWN and self.matrix is not None:
-                mx, my = pygame.mouse.get_pos()
-                rel_x, rel_y = mx - 20, my - 60
-                scale_w = minimap.shape[1] / 250
-                scale_h = minimap.shape[0] / 250
-                final_x = int(rel_x * scale_w)
-                final_y = int(rel_y * scale_h)
-                if 0 <= final_x < minimap.shape[1] and 0 <= final_y < minimap.shape[0]:
-                    self.target_pos = (final_x, final_y)
 
         self.screen.fill(BG_COLOR)
         
-        # Desenha a Visão da Câmera
+        # --- Visão Câmera ---
         if minimap is not None and minimap.size > 0:
             rgb = cv2.cvtColor(minimap, cv2.COLOR_BGR2RGB)
             rgb = np.transpose(rgb, (1, 0, 2))
@@ -142,9 +198,13 @@ class FinalFantasyBot:
             surf = pygame.transform.scale(surf, (250, 250))
             self.screen.blit(surf, (20, 60))
             pygame.draw.rect(self.screen, (255, 255, 255), (20, 60, 250, 250), 2)
-            self.screen.blit(self.font.render("VISAO (Use Setas/WASD para ajustar)", True, (200, 200, 200)), (20, 40))
+            
+            # Info do tamanho detectado
+            size_txt = "GRANDE (267)" if self.current_size == self.SIZE_BIG else "PEQUENO (187)"
+            color_sz = (0, 255, 255) if self.current_size == self.SIZE_BIG else (255, 200, 150)
+            self.screen.blit(self.font.render(f"DETECTADO: {size_txt}", True, color_sz), (20, 320))
 
-        # Desenha a Matriz (Debug)
+        # --- Matriz Lógica ---
         if mask_debug is not None and mask_debug.size > 0:
             mask_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2RGB)
             mask_rgb = np.transpose(mask_rgb, (1, 0, 2))
@@ -152,70 +212,41 @@ class FinalFantasyBot:
             surf_m = pygame.transform.scale(surf_m, (250, 250))
             self.screen.blit(surf_m, (300, 60))
             pygame.draw.rect(self.screen, (0, 255, 255), (300, 60, 250, 250), 1)
-            self.screen.blit(self.font.render("MATRIZ LOGICA", True, (0, 255, 255)), (300, 40))
 
-        # Status Texto
-        self.screen.blit(self.font.render(f"AJUSTE MANUAL: X={self.map_x} Y={self.map_y} W={self.map_w} H={self.map_h}", True, (255, 255, 0)), (20, 360))
+        # Infos
+        info = f"OFFSET: X={self.map_offset_x} Y={self.map_offset_y}"
+        self.screen.blit(self.font.render(info, True, (255, 255, 0)), (20, 360))
         
         pos_txt = f"Player: {self.current_pos}"
-        tar_txt = f"Target: {self.target_pos}"
         self.screen.blit(self.font.render(pos_txt, True, (0, 255, 0)), (20, 390))
-        self.screen.blit(self.font.render(tar_txt, True, (255, 0, 255)), (20, 410))
 
         pygame.display.flip()
 
-    def decide_move(self):
-        # Lógica mantida...
-        if self.target_pos:
-            tx, ty = self.target_pos
-            px, py = self.current_pos
-            if abs(tx - px) < 5 and abs(ty - py) < 5:
-                self.target_pos = None
-                return None
-            dx = tx - px
-            dy = ty - py
-            if abs(dx) > abs(dy): return 'right' if dx > 0 else 'left'
-            else: return 'down' if dy > 0 else 'up'
-        else:
-            if random.random() < 0.05:
-                return random.choice(['up', 'down', 'left', 'right'])
-            return None
-
     def run(self):
-        print("🎮 BOT INICIADO - Calibre usando SETAS e WASD!")
+        print("🎮 BOT INICIADO - Auto-Detecção de Tamanho Ativa!")
         
         while self.running:
-            self.handle_calibration_input() # <--- Verifica teclas
-            
+            self.handle_input()
             win = self.get_window_geometry()
+            
             if not win:
-                self.draw_dashboard(None, None, "AGUARDANDO FINAL FANTASY...")
+                # Standby...
                 time.sleep(0.5)
                 continue
 
             try:
-                minimap = self.capture_minimap(win)
-                if minimap is None or minimap.size == 0: continue
-
+                # 1. Captura Inteligente (Decide tamanho sozinho)
+                minimap = self.capture_and_resize(win)
+                
+                # 2. Processa
                 self.current_pos = self.find_player(minimap)
                 self.matrix, mask_debug = self.generate_matrix(minimap)
                 
-                # Visual Debug
                 if self.current_pos:
                     cv2.circle(minimap, self.current_pos, 5, (0, 255, 0), -1)
-                if self.target_pos:
-                    cv2.circle(minimap, self.target_pos, 5, (255, 0, 255), -1)
-                    if self.current_pos:
-                         cv2.line(minimap, self.current_pos, self.target_pos, (255, 255, 0), 1)
 
-                if self.current_pos:
-                    move = self.decide_move()
-                    if move and (time.time() - self.last_move_time > self.move_interval):
-                        # Descomente para andar de verdade
-                        # pyautogui.keyDown(move); time.sleep(0.05); pyautogui.keyUp(move)
-                        self.last_move_time = time.time()
-
-                self.draw_dashboard(minimap, mask_debug, "RODANDO")
+                # 3. Desenha
+                self.draw_dashboard(minimap, mask_debug)
                 self.clock.tick(30)
 
             except Exception as e:

@@ -10,7 +10,7 @@ import pygame
 
 # --- CONFIGURAÇÕES ---
 WINDOW_NAME_PART = "Final Fantasy"
-DEBUG_WIDTH = 600
+DEBUG_WIDTH = 1000  
 DEBUG_HEIGHT = 600
 BG_COLOR = (30, 30, 35)
 
@@ -19,29 +19,32 @@ class FinalFantasyBot:
         self.sct = mss.mss()
         self.current_pos = None
         self.target_pos = None
-        self.matrix = None
         
-        # --- MEMÓRIA DE VISITAÇÃO (O Rastro) ---
-        self.visited_canvas = None # Vai ser uma imagem preta que pintamos de branco
-        
-        # --- CONFIGURAÇÃO DE ALINHAMENTO ---
+        # --- CONFIGURAÇÃO DE CAPTURA ---
         self.rel_right_x = 1205
         self.rel_y = -20
-        
-        # Tamanhos
         self.SIZE_BIG = 267     
         self.SIZE_SMALL = 187   
         
+        # --- MAPA GLOBAL DINÂMICO (SLAM) ---
+        # Começamos com um canvas 800x800
+        self.global_map = np.zeros((800, 800, 3), dtype=np.uint8)
+        self.global_visited = np.zeros((800, 800), dtype=np.uint8)
+        
+        # Posição da "Câmera" no Mapa Global (Começa no meio)
+        self.cam_global_x = 400
+        self.cam_global_y = 400
+        
+        self.last_frame_gray = None
         self.current_map_mode = "MUNDI"
-
         self.last_move_time = 0
         self.move_interval = 0.1
 
         # Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT))
-        pygame.display.set_caption("CEREBRO DO BOT - Visited Mask")
-        self.font = pygame.font.SysFont("Consolas", 16, bold=True)
+        pygame.display.set_caption("CEREBRO DO BOT - SLAM Mapping Fixed")
+        self.font = pygame.font.SysFont("Consolas", 14, bold=True)
         self.clock = pygame.time.Clock()
         self.running = True
 
@@ -95,6 +98,8 @@ class FinalFantasyBot:
                 
                 if is_blue_map:
                     self.current_map_mode = "MUNDI (267px)"
+                    # Se for mapa mundi, retornamos ele todo. 
+                    # Resetar SLAM se mudar de modo? Por enquanto não.
                     return img
                 else:
                     self.current_map_mode = "CIDADE (187px)"
@@ -105,6 +110,84 @@ class FinalFantasyBot:
                         return img
         except Exception as e: return None
         return None
+
+    def update_slam_map(self, frame):
+        """Lógica de Costura de Mapa (Stitching)"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+
+        # Inicialização
+        if self.last_frame_gray is None:
+            self.last_frame_gray = gray
+            # Cola no centro
+            self.global_map[self.cam_global_y:self.cam_global_y+h, self.cam_global_x:self.cam_global_x+w] = frame
+            return
+
+        # Se o tamanho do recorte mudou (entrou na cidade), reseta a referência para evitar crash
+        if self.last_frame_gray.shape != gray.shape:
+             self.last_frame_gray = gray
+             return
+
+        # 1. CALCULAR DESLOCAMENTO
+        margin = 40
+        # Pega um pedaço do frame anterior
+        patch = self.last_frame_gray[margin:h-margin, margin:w-margin]
+        
+        try:
+            # Procura esse pedaço no frame novo
+            res = cv2.matchTemplate(gray, patch, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(res)
+            
+            # Calcula o delta
+            dx = max_loc[0] - margin
+            dy = max_loc[1] - margin
+            
+            # Atualiza posição GLOBAL da câmera (Invertido: Se a imagem foi pra esq, camera foi pra dir)
+            self.cam_global_x -= dx
+            self.cam_global_y -= dy
+
+            # 2. EXPANSÃO AUTOMÁTICA (Pad)
+            pad = 100
+            gh, gw, _ = self.global_map.shape
+            
+            pad_left = 0
+            pad_top = 0
+            
+            # Verifica estouro de bordas
+            if self.cam_global_x < pad:
+                pad_left = 200
+                self.cam_global_x += pad_left
+            if self.cam_global_y < pad:
+                pad_top = 200
+                self.cam_global_y += pad_top
+            
+            pad_right = 0
+            pad_bottom = 0
+            if self.cam_global_x + w > gw - pad: pad_right = 200
+            if self.cam_global_y + h > gh - pad: pad_bottom = 200
+                
+            if pad_left or pad_right or pad_top or pad_bottom:
+                self.global_map = np.pad(self.global_map, ((pad_top, pad_bottom), (pad_left, pad_right), (0,0)), mode='constant')
+                self.global_visited = np.pad(self.global_visited, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
+                print(f"🗺️ MAPA EXPANDIDO! {self.global_map.shape}")
+
+            # 3. COLAGEM (Stitching)
+            y1, y2 = self.cam_global_y, self.cam_global_y + h
+            x1, x2 = self.cam_global_x, self.cam_global_x + w
+            
+            # Garante que não vai estourar índice (Safety Check)
+            if y2 <= self.global_map.shape[0] and x2 <= self.global_map.shape[1]:
+                self.global_map[y1:y2, x1:x2] = frame
+                
+                # Rastro (Marca o centro da câmera como visitado)
+                cx = self.cam_global_x + w//2
+                cy = self.cam_global_y + h//2
+                cv2.circle(self.global_visited, (cx, cy), 4, 255, -1)
+            
+            self.last_frame_gray = gray
+            
+        except Exception as e:
+            print(f"Erro SLAM: {e}")
 
     def detect_dialogue_bubble(self, win_geo):
         cx = win_geo["left"] + (win_geo["width"] // 2) - 200
@@ -137,21 +220,6 @@ class FinalFantasyBot:
                 return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
         return None
 
-    def update_visited_mask(self, minimap_shape, player_pos):
-        """Atualiza a matriz booleana de visitados (Branco=Visitado, Preto=Não)"""
-        h, w = minimap_shape[:2]
-        
-        # Inicializa ou Reseta se o tamanho do mapa mudou
-        if self.visited_canvas is None or self.visited_canvas.shape != (h, w):
-            self.visited_canvas = np.zeros((h, w), dtype=np.uint8) # Matriz Preta (0)
-            
-        # Marca onde o jogador está (Branco - 255)
-        if player_pos:
-            # Desenha um círculo para ficar mais visível que um pixel único
-            cv2.circle(self.visited_canvas, player_pos, 4, 255, -1)
-            
-        return self.visited_canvas
-
     def handle_calibration_input(self):
         keys = pygame.key.get_pressed()
         speed = 5 if (keys[pygame.K_LSHIFT]) else 1
@@ -160,83 +228,89 @@ class FinalFantasyBot:
         if keys[pygame.K_UP]:    self.rel_y -= speed
         if keys[pygame.K_DOWN]:  self.rel_y += speed
 
-    def draw_dashboard(self, minimap, visited_mask, status_text, is_dialogue=False):
+    def draw_dashboard(self, minimap, status_text, is_dialogue=False):
         for event in pygame.event.get():
             if event.type == pygame.QUIT: self.running = False
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                # Clique do mouse para definir objetivo
-                mx, my = pygame.mouse.get_pos()
-                current_w = minimap.shape[1] if minimap is not None else self.SIZE_BIG
-                # Ajusta para clicar na imagem da esquerda (Visão Câmera)
-                rx, ry = mx - 20, my - 80
-                if 0 <= rx < current_w and 0 <= ry < current_w:
-                    self.target_pos = (rx, ry)
-
+            
         self.screen.fill(BG_COLOR)
         
-        # 1. MINIMAPA (Esquerda)
+        # 1. VISÃO ATUAL (Esquerda)
         if minimap is not None:
             rgb = cv2.cvtColor(minimap, cv2.COLOR_BGR2RGB)
-            rgb = np.transpose(rgb, (1, 0, 2))
-            surf = pygame.surfarray.make_surface(rgb)
+            surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
             self.screen.blit(surf, (20, 80))
-            current_w = minimap.shape[1]
-            current_h = minimap.shape[0]
-            pygame.draw.rect(self.screen, (255, 255, 255), (20, 80, current_w, current_h), 2)
-            self.screen.blit(self.font.render(f"Câmera ({current_w}x{current_h})", True, (200, 200, 200)), (20, 60))
+            pygame.draw.rect(self.screen, (255, 255, 255), (20, 80, minimap.shape[1], minimap.shape[0]), 2)
+            self.screen.blit(self.font.render("Visão Atual", True, (200, 200, 200)), (20, 60))
 
-        # 2. MATRIZ DE VISITADOS (Direita - Substitui a Visão Lógica)
-        if visited_mask is not None:
-            # O canvas é grayscale (1 canal), precisamos converter pra RGB pro Pygame
-            v_rgb = cv2.cvtColor(visited_mask, cv2.COLOR_GRAY2RGB)
-            v_rgb = np.transpose(v_rgb, (1, 0, 2))
-            surf_v = pygame.surfarray.make_surface(v_rgb)
+        # 2. MAPA GLOBAL COSTURADO (Direita)
+        gh, gw, _ = self.global_map.shape
+        if gh > 0 and gw > 0:
+            scale = min(500/gw, 400/gh)
+            new_w, new_h = int(gw*scale), int(gh*scale)
             
-            offset_x = 20 + (minimap.shape[1] if minimap is not None else 270) + 20
-            self.screen.blit(surf_v, (offset_x, 80))
-            pygame.draw.rect(self.screen, (0, 255, 0), (offset_x, 80, visited_mask.shape[1], visited_mask.shape[0]), 1)
-            
-            # Título atualizado
-            self.screen.blit(self.font.render("Matriz Visitados (Rastro)", True, (0, 255, 0)), (offset_x, 60))
+            if new_w > 0 and new_h > 0:
+                small_global = cv2.resize(self.global_map, (new_w, new_h))
+                small_visited = cv2.resize(self.global_visited, (new_w, new_h))
 
-        # STATUS
+                # --- FIX DO CRASH AQUI ---
+                # Em vez de addWeighted, usamos lógica NumPy pura com Broadcasting
+                # Acha pixels visitados
+                visited_indices = small_visited > 0
+                
+                # Se tiver algum lugar visitado, pinta de verde semi-transparente
+                if np.any(visited_indices):
+                    # Pega os pixels originais
+                    pixels = small_global[visited_indices]
+                    # Define Verde BGR (OpenCV usa BGR)
+                    green = np.array([0, 255, 0], dtype=np.float32)
+                    # Mistura: 50% Cor Original + 50% Verde
+                    blended = (pixels * 0.5 + green * 0.5).astype(np.uint8)
+                    # Atribui de volta
+                    small_global[visited_indices] = blended
+
+                # Desenha o quadrado da câmera
+                if minimap is not None:
+                    cam_x_s = int(self.cam_global_x * scale)
+                    cam_y_s = int(self.cam_global_y * scale)
+                    cam_w_s = int(minimap.shape[1] * scale)
+                    cam_h_s = int(minimap.shape[0] * scale)
+                    cv2.rectangle(small_global, (cam_x_s, cam_y_s), (cam_x_s+cam_w_s, cam_y_s+cam_h_s), (0, 255, 255), 2)
+
+                rgb_global = cv2.cvtColor(small_global, cv2.COLOR_BGR2RGB)
+                surf_g = pygame.surfarray.make_surface(np.transpose(rgb_global, (1, 0, 2)))
+                
+                self.screen.blit(surf_g, (300, 80))
+                pygame.draw.rect(self.screen, (100, 100, 255), (300, 80, new_w, new_h), 1)
+                self.screen.blit(self.font.render(f"MAPA GLOBAL ({gw}x{gh})", True, (100, 100, 255)), (300, 60))
+
         c = (255, 50, 50) if is_dialogue else (0, 255, 0)
         self.screen.blit(self.font.render(f"STATUS: {status_text}", True, c), (20, 20))
-        
-        coords_str = f"X_FIM: {self.rel_right_x} | Y_TOPO: {self.rel_y}"
-        self.screen.blit(self.font.render(coords_str, True, (255, 255, 0)), (20, 400))
-        self.screen.blit(self.font.render(f"MODO: {self.current_map_mode}", True, (100, 200, 255)), (20, 430))
-        self.screen.blit(self.font.render(f"Target: {self.target_pos}", True, (255, 0, 255)), (20, 460))
+        self.screen.blit(self.font.render(f"OFFSET X: {self.rel_right_x}", True, (255, 255, 0)), (20, 400))
         
         pygame.display.flip()
 
     def get_move(self):
-        if not self.target_pos or not self.current_pos: return None
-        dx, dy = self.target_pos[0] - self.current_pos[0], self.target_pos[1] - self.current_pos[1]
-        if abs(dx) < 5 and abs(dy) < 5: return None
-        return ('right' if dx > 0 else 'left') if abs(dx) > abs(dy) else ('down' if dy > 0 else 'up')
+        if random.random() < 0.05:
+             return random.choice(['up', 'down', 'left', 'right'])
+        return None
 
     def run(self):
-        print("🎮 BOT RODANDO - Matriz de Visitados Ativa!")
+        print("🎮 BOT RODANDO - Crash corrigido! Costurando mapa...")
         while self.running:
             self.handle_calibration_input()
             win = self.get_window_geometry()
             
             if not win:
-                self.draw_dashboard(None, None, "AGUARDANDO JOGO...", False)
+                self.draw_dashboard(None, "AGUARDANDO...", False)
                 time.sleep(0.5)
                 continue
 
             minimap = self.capture_smart_map(win)
             if minimap is None: continue
 
+            # SLAM
+            self.update_slam_map(minimap)
             self.current_pos = self.find_player(minimap)
-            
-            # ATUALIZA A MATRIZ DE VISITADOS
-            visited_mask = self.update_visited_mask(minimap.shape, self.current_pos)
-            
-            if self.current_pos: cv2.circle(minimap, self.current_pos, 5, (0, 255, 0), -1)
-            if self.target_pos: cv2.circle(minimap, self.target_pos, 5, (255, 0, 255), -1)
 
             is_chat = self.detect_dialogue_bubble(win)
             if is_chat:
@@ -247,8 +321,7 @@ class FinalFantasyBot:
                     pyautogui.keyDown(move); time.sleep(0.05); pyautogui.keyUp(move)
                     self.last_move_time = time.time()
 
-            # Passa a visited_mask para desenhar em vez da debug mask antiga
-            self.draw_dashboard(minimap, visited_mask, "DIALOGO" if is_chat else "RODANDO", is_chat)
+            self.draw_dashboard(minimap, "EXPLORANDO", is_chat)
             self.clock.tick(30)
         pygame.quit()
 

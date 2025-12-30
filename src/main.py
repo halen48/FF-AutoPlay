@@ -7,50 +7,56 @@ import random
 import subprocess
 import re
 import pygame
+import hashlib
 
 # --- CONFIGURAÇÕES ---
 WINDOW_NAME_PART = "Final Fantasy"
 DEBUG_WIDTH = 1000
-DEBUG_HEIGHT = 600
+DEBUG_HEIGHT = 650
 BG_COLOR = (30, 30, 35)
 
 class FinalFantasyBot:
     def __init__(self):
         self.sct = mss.mss()
         
-        # --- CONFIGURAÇÃO DE CAPTURA ---
+        # --- OFFSET E TAMANHO ---
         self.rel_right_x = 1205
         self.rel_y = -20
         self.SIZE_BIG = 267     
         self.SIZE_SMALL = 187   
         
-        # --- LÓGICA CIDADE (CANVAS 1024x1024) ---
+        # --- BANCO DE DADOS DE MAPAS (Memória) ---
+        # Dicionário: { 'HASH_DO_BALAO': Matriz_Numpy_1024x1024 }
+        self.maps_memory = {} 
+        self.current_map_hash = None # ID do mapa atual
+        
+        # --- CANVAS ATUAIS ---
         self.TOWN_SIZE = 1024
         self.town_canvas = np.zeros((self.TOWN_SIZE, self.TOWN_SIZE), dtype=np.uint8)
-        # Começa no meio do canvas
         self.town_x = self.TOWN_SIZE // 2
         self.town_y = self.TOWN_SIZE // 2
 
-        # --- LÓGICA WORLD MAP (GLOBO/%) ---
-        # Vamos assumir um tamanho arbitrário de passos para dar a volta no mundo
-        # Ex: 4000 passos para dar a volta completa. O % vai garantir o loop.
-        self.WORLD_MAX_STEPS = 4000 
+        self.WORLD_SIZE = self.SIZE_BIG
+        self.world_canvas = np.zeros((self.WORLD_SIZE, self.WORLD_SIZE), dtype=np.uint8)
         self.world_x = 0
         self.world_y = 0
 
-        # --- ESTADO GERAL ---
-        self.current_map_mode = "DESCONHECIDO" # MUNDI ou CIDADE
+        # --- ESTADO ---
+        self.current_map_mode = "MUNDI" # Começa no mundo por padrão
         self.last_map_frame = None
+        self.current_pos = None
+        self.target_pos = None
         
         # Navegação
         self.current_direction = 'down' 
         self.stuck_counter = 0
         self.failed_directions = [] 
+        self.last_move_time = 0
 
         # Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT))
-        pygame.display.set_caption("CEREBRO DO BOT - Hybrid Mapping")
+        pygame.display.set_caption("CEREBRO DO BOT - Map Hashing System")
         self.font = pygame.font.SysFont("Consolas", 14, bold=True)
         self.clock = pygame.time.Clock()
         self.running = True
@@ -75,8 +81,72 @@ class FinalFantasyBot:
         for k in ['up', 'down', 'left', 'right', 'enter']:
             pyautogui.keyUp(k)
 
+    def check_map_transition(self, win_geo):
+        """
+        Verifica o TOPO da tela procurando o Balão Azul com o nome do mapa.
+        Se achar, calcula o HASH e troca o mapa na memória.
+        """
+        # Região do Balão (Topo Centro)
+        # Ajuste esses valores se o balão não estiver sendo pego
+        w_balao = 400
+        h_balao = 80
+        cx = win_geo["left"] + (win_geo["width"] // 2) - (w_balao // 2)
+        cy = win_geo["top"] + 50 # Um pouco abaixo da barra de título
+        
+        region = {"top": int(cy), "left": int(cx), "width": int(w_balao), "height": int(h_balao)}
+        
+        try:
+            sct_img = self.sct.grab(region)
+            img = np.array(sct_img)
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            # Verifica se é AZUL (Cor do balão de texto de local)
+            avg_color = np.mean(img_bgr, axis=(0, 1))
+            blue, green, red = avg_color
+            
+            # Critério: Muito Azul, pouco Vermelho (Balão padrão FF)
+            is_banner = (blue > 100) and (blue > red + 20) and (blue > green + 10)
+            
+            if is_banner:
+                # Gera o HASH (ID Único do Mapa)
+                # Usamos md5 no buffer da imagem para identificar o texto escrito
+                img_hash = hashlib.md5(img_bgr.tobytes()).hexdigest()
+                
+                # Se detectou um mapa NOVO (ou voltou para um diferente)
+                if img_hash != self.current_map_hash:
+                    print(f"🌍 TROCA DE MAPA DETECTADA! Hash: {img_hash[:8]}...")
+                    
+                    # 1. Salva o progresso do mapa anterior (se não for nulo/mundi)
+                    if self.current_map_hash is not None and self.current_map_mode == "CIDADE":
+                        self.maps_memory[self.current_map_hash] = self.town_canvas.copy()
+                        print("💾 Mapa anterior salvo na memória.")
+
+                    # 2. Carrega ou Cria o novo mapa
+                    if img_hash in self.maps_memory:
+                        print("📂 Mapa conhecido! Carregando exploração...")
+                        self.town_canvas = self.maps_memory[img_hash]
+                    else:
+                        print("✨ Mapa Novo! Criando canvas em branco.")
+                        self.town_canvas = np.zeros((self.TOWN_SIZE, self.TOWN_SIZE), dtype=np.uint8)
+                        # Reseta posição para o meio em mapa novo
+                        self.town_x = self.TOWN_SIZE // 2
+                        self.town_y = self.TOWN_SIZE // 2
+                    
+                    # Atualiza Estado
+                    self.current_map_hash = img_hash
+                    self.current_map_mode = "CIDADE"
+                    
+                    # Pequeno sleep para o fadeout terminar e não bugar movimento
+                    time.sleep(0.5) 
+                    return True
+                    
+        except Exception as e:
+            print(e)
+            pass
+        return False
+
     def capture_smart_map(self, win_geo):
-        # ... (Lógica de captura e detecção de cor mantida) ...
+        # Lógica de captura padrão
         start_x_relative = self.rel_right_x - self.SIZE_BIG
         abs_top = win_geo["top"] + self.rel_y
         abs_left = win_geo["left"] + start_x_relative
@@ -105,10 +175,17 @@ class FinalFantasyBot:
                 blue, green, red = avg_color
                 is_blue_map = (blue > red) and (blue > green) and (blue > 40)
                 
+                # Se for Azulão e NÃO temos um hash de cidade ativo (ou perdemos o balão há muito tempo)
+                # Assumimos MUNDI. Mas a prioridade é o balão.
                 if is_blue_map:
+                    # Se estávamos em cidade, salvamos antes de ir pro mundi
+                    if self.current_map_mode == "CIDADE" and self.current_map_hash:
+                         self.maps_memory[self.current_map_hash] = self.town_canvas.copy()
+                    
                     self.current_map_mode = "MUNDI"
                     return img
                 else:
+                    # É bege/cidade
                     self.current_map_mode = "CIDADE"
                     diff = self.SIZE_BIG - self.SIZE_SMALL
                     if img.shape[0] > self.SIZE_SMALL and img.shape[1] > diff:
@@ -118,67 +195,48 @@ class FinalFantasyBot:
         return None
 
     def detect_movement(self, frame):
-        """Verifica visualmente se o mapa mexeu"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         moved = False
-        
         if self.last_map_frame is not None and self.last_map_frame.shape == gray.shape:
             score = cv2.absdiff(self.last_map_frame, gray)
-            non_zero = np.count_nonzero(score > 10) 
-            
-            if non_zero > 50:
+            if np.count_nonzero(score > 10) > 50:
                 moved = True
                 self.stuck_counter = 0
-                if len(self.failed_directions) > 0:
-                    self.failed_directions = [] 
+                if self.failed_directions: self.failed_directions = [] 
             else:
                 moved = False
                 self.stuck_counter += 1
-
         self.last_map_frame = gray
         return moved
 
-    def update_logical_position(self, direction):
-        """
-        ATUALIZA O XY DO MAPA COM BASE NA DIREÇÃO E NO MODO.
-        Só é chamado se detect_movement() for True.
-        """
-        dx, dy = 0, 0
-        if direction == 'up': dy = -1
-        elif direction == 'down': dy = 1
-        elif direction == 'left': dx = -1
-        elif direction == 'right': dx = 1
+    def update_position_logic(self, moved, direction):
+        if self.current_map_mode == "MUNDI":
+            if self.current_pos:
+                self.world_x, self.world_y = self.current_pos
+                self.world_x = max(0, min(self.world_x, self.WORLD_SIZE - 1))
+                self.world_y = max(0, min(self.world_y, self.WORLD_SIZE - 1))
+                cv2.circle(self.world_canvas, (self.world_x, self.world_y), 2, 255, -1)
 
-        # MODO 1: CIDADE (Matriz Finita 1024x1024)
-        if self.current_map_mode == "CIDADE":
+        elif self.current_map_mode == "CIDADE" and moved:
+            dx, dy = 0, 0
+            if direction == 'up': dy = -1
+            elif direction == 'down': dy = 1
+            elif direction == 'left': dx = -1
+            elif direction == 'right': dx = 1
+            
             self.town_x += dx
             self.town_y += dy
-            
-            # Clamp (Não deixa sair do papel)
             self.town_x = max(0, min(self.town_x, self.TOWN_SIZE - 1))
             self.town_y = max(0, min(self.town_y, self.TOWN_SIZE - 1))
-            
-            # Pinta o rastro (Branco)
-            # Pintamos um raio de 2px para ficar visível
             cv2.circle(self.town_canvas, (self.town_x, self.town_y), 2, 255, -1)
-
-        # MODO 2: WORLD MAP (Globo Infinito com %)
-        elif self.current_map_mode == "MUNDI":
-            self.world_x += dx
-            self.world_y += dy
-            
-            # Lógica de Módulo (%) para resetar nas extremidades
-            # Isso simula a volta ao mundo
-            self.world_x = self.world_x % self.WORLD_MAX_STEPS
-            self.world_y = self.world_y % self.WORLD_MAX_STEPS
 
     def pick_smart_direction(self):
         all_dirs = ['up', 'down', 'left', 'right']
-        valid_options = [d for d in all_dirs if d not in self.failed_directions]
-        if not valid_options:
+        valid = [d for d in all_dirs if d not in self.failed_directions]
+        if not valid:
             self.failed_directions = []
-            valid_options = all_dirs
-        return random.choice(valid_options)
+            valid = all_dirs
+        return random.choice(valid)
 
     def detect_dialogue_bubble(self, win_geo):
         cx = win_geo["left"] + (win_geo["width"] // 2) - 200
@@ -198,6 +256,19 @@ class FinalFantasyBot:
         except: pass
         return False
 
+    def find_player(self, img):
+        if img is None: return None
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([0, 150, 100]), np.array([10, 255, 255])) + \
+               cv2.inRange(hsv, np.array([170, 150, 100]), np.array([180, 255, 255]))
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+        return None
+
     def handle_calibration_input(self):
         keys = pygame.key.get_pressed()
         speed = 5 if (keys[pygame.K_LSHIFT]) else 1
@@ -212,112 +283,108 @@ class FinalFantasyBot:
         
         self.screen.fill(BG_COLOR)
         
-        # 1. VISÃO ATUAL (Esquerda)
+        # 1. VISÃO CÂMERA
         if minimap is not None:
             rgb = cv2.cvtColor(minimap, cv2.COLOR_BGR2RGB)
             surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
             self.screen.blit(surf, (20, 80))
             pygame.draw.rect(self.screen, (255, 255, 255), (20, 80, minimap.shape[1], minimap.shape[0]), 2)
-            self.screen.blit(self.font.render("Câmera", True, (200, 200, 200)), (20, 60))
+            self.screen.blit(self.font.render(f"Câmera ({minimap.shape[1]}px)", True, (200, 200, 200)), (20, 60))
 
-        # 2. MAPA LÓGICO (Direita) - Depende do Modo
-        preview_size = 300
+        # 2. MAPA LÓGICO
         off_x = 350
+        preview_size = 300
         
         if self.current_map_mode == "CIDADE":
-            # Mostra o Canvas 1024x1024
             canvas_rgb = cv2.cvtColor(self.town_canvas, cv2.COLOR_GRAY2RGB)
-            # Desenha player
             cv2.circle(canvas_rgb, (self.town_x, self.town_y), 5, (0, 0, 255), -1)
-            
-            surf_town = pygame.surfarray.make_surface(np.transpose(canvas_rgb, (1, 0, 2)))
-            surf_town = pygame.transform.scale(surf_town, (preview_size, preview_size))
-            
-            self.screen.blit(surf_town, (off_x, 80))
+            surf_map = pygame.surfarray.make_surface(np.transpose(canvas_rgb, (1, 0, 2)))
+            surf_map = pygame.transform.scale(surf_map, (preview_size, preview_size))
+            self.screen.blit(surf_map, (off_x, 80))
             pygame.draw.rect(self.screen, (0, 255, 0), (off_x, 80, preview_size, preview_size), 1)
-            header = f"MAPA CIDADE (1024px) - {self.town_x},{self.town_y}"
+            
+            # Mostra o HASH atual (ID do Mapa)
+            h_str = self.current_map_hash[:8] if self.current_map_hash else "???"
+            header = f"CIDADE ID: {h_str}..."
             
         else: # MUNDI
-            # Mostra um gráfico abstrato de coordenadas globo
-            # Fundo Azul para representar o mundo
-            world_surf = pygame.Surface((preview_size, preview_size))
-            world_surf.fill((0, 0, 50))
-            
-            # Calcula posição relativa no globo (0 a 1)
-            rel_x = (self.world_x / self.WORLD_MAX_STEPS) * preview_size
-            rel_y = (self.world_y / self.WORLD_MAX_STEPS) * preview_size
-            
-            pygame.draw.circle(world_surf, (0, 255, 255), (int(rel_x), int(rel_y)), 10)
-            self.screen.blit(world_surf, (off_x, 80))
-            pygame.draw.rect(self.screen, (0, 100, 255), (off_x, 80, preview_size, preview_size), 1)
-            
-            pct_x = (self.world_x / self.WORLD_MAX_STEPS) * 100
-            pct_y = (self.world_y / self.WORLD_MAX_STEPS) * 100
-            header = f"MUNDO (GLOBO) - {pct_x:.1f}%, {pct_y:.1f}%"
+            canvas_rgb = cv2.cvtColor(self.world_canvas, cv2.COLOR_GRAY2RGB)
+            cv2.circle(canvas_rgb, (self.world_x, self.world_y), 5, (0, 0, 255), -1)
+            surf_map = pygame.surfarray.make_surface(np.transpose(canvas_rgb, (1, 0, 2)))
+            self.screen.blit(surf_map, (off_x, 80))
+            pygame.draw.rect(self.screen, (0, 100, 255), (off_x, 80, 267, 267), 1)
+            header = "MAPA MUNDI (Globo)"
 
         self.screen.blit(self.font.render(header, True, (0, 255, 255)), (off_x, 60))
 
-        # STATUS GERAL
+        # STATUS E LISTA DE MAPAS
         c = (0, 255, 0) if "ANDANDO" in status_text else (255, 50, 50)
         self.screen.blit(self.font.render(f"STATUS: {status_text}", True, c), (20, 20))
+        
+        # Mostra quantos mapas já salvamos
+        count_maps = len(self.maps_memory)
+        self.screen.blit(self.font.render(f"MAPAS NA MEMÓRIA: {count_maps}", True, (255, 100, 255)), (20, 450))
         
         pygame.display.flip()
 
     def run(self):
-        print("🎮 BOT HYBRID - 1024px Town / % World")
-        directions = ['up', 'right', 'down', 'left']
-
+        print("🎮 BOT RODANDO - Sistema de Hash de Mapas")
+        
         while self.running:
             self.handle_calibration_input()
-            
             win = self.get_window_geometry()
+            
             if not win:
                 self.release_all_keys()
-                self.draw_dashboard(None, "PAUSADO (Sem foco)")
+                self.draw_dashboard(None, "PAUSADO")
                 time.sleep(0.5)
                 continue
+
+            # --- CHECAGEM DE TRANSIÇÃO (BALÃO) ---
+            # Verifica se apareceu o balão azul de nome de mapa
+            self.check_map_transition(win)
 
             minimap = self.capture_smart_map(win)
             if minimap is None: continue
 
+            self.current_pos = self.find_player(minimap)
+            moved = self.detect_movement(minimap)
+            
             if self.detect_dialogue_bubble(win):
                 self.release_all_keys()
                 pyautogui.press('enter')
                 self.draw_dashboard(minimap, "DIALOGO")
                 continue
 
-            # --- CICLO DE MOVIMENTO (LONG PRESS) ---
             print(f"🏃 Andando: {self.current_direction}")
             pyautogui.keyDown(self.current_direction)
-            
             start_move_time = time.time()
             collision_detected = False
             
-            # Segura por até 5s
             while time.time() - start_move_time < 5.0:
                 current_win = self.get_window_geometry()
                 if not current_win:
                     self.release_all_keys()
                     break
 
+                # Verifica transição de mapa DURANTE o movimento (Importante!)
+                if self.check_map_transition(current_win):
+                    self.release_all_keys()
+                    break # Interrompe movimento para se ajustar ao novo mapa
+
                 current_minimap = self.capture_smart_map(current_win)
                 if current_minimap is None: break
 
-                # 1. Verifica se mexeu
-                moved = self.detect_movement(current_minimap)
+                self.current_pos = self.find_player(current_minimap)
+                frame_moved = self.detect_movement(current_minimap)
                 
-                # 2. Se mexeu, atualiza a lógica do mapa (Pinta XY ou Incrementa %)
-                if moved:
-                    self.update_logical_position(self.current_direction)
+                self.update_position_logic(frame_moved, self.current_direction)
                 
-                # 3. Desenha
                 self.draw_dashboard(current_minimap, f"ANDANDO: {self.current_direction.upper()}")
                 self.clock.tick(30) 
 
-                # 4. Checa colisão
-                if not moved:
+                if not frame_moved:
                     if self.stuck_counter > 5:
-                        print("🚫 COLISÃO CONFIRMADA.")
                         collision_detected = True
                         break 
                 
@@ -328,11 +395,9 @@ class FinalFantasyBot:
 
             pyautogui.keyUp(self.current_direction)
             
-            # --- ESTRATÉGIA PÓS-COLISÃO ---
             if collision_detected:
                 if self.current_direction not in self.failed_directions:
                     self.failed_directions.append(self.current_direction)
-                
                 self.current_direction = self.pick_smart_direction()
                 time.sleep(0.2)
 

@@ -20,9 +20,9 @@ BG_COLOR = (30, 30, 35)
 KEY_SQUARE = 'v' 
 KEY_CONFIRM = 'enter'
 
-# CORES
+# CORES E LIMIARES
 TARGET_CITY_BGR = np.array([148, 203, 244], dtype=np.float32)
-CITY_COLOR_THRESHOLD = 60.0 
+CITY_COLOR_THRESHOLD = 150.0  # <--- Atualizado conforme pedido
 MAP_CHANGE_THRESHOLD = 0.65 
 
 # ESTADOS DO TILE
@@ -50,8 +50,6 @@ class FinalFantasyBot:
         self.town_grid = np.zeros((self.TOWN_SIZE, self.TOWN_SIZE), dtype=np.uint8)
         self.town_x = self.TOWN_SIZE // 2
         self.town_y = self.TOWN_SIZE // 2
-        
-        # Marca ponto inicial
         self.town_grid[self.town_y, self.town_x] = TILE_WALKABLE
 
         self.WORLD_SIZE = self.SIZE_BIG
@@ -61,22 +59,25 @@ class FinalFantasyBot:
 
         # ESTADO
         self.current_map_mode = "MUNDI"
-        self.active_target = None  
-        self.path_fail_count = 0   
-        self.current_pos = None # Posição visual (pixel) para debug
+        self.last_map_frame = None
+        self.current_pos = None 
         
         self.debug_similarity = 1.0
         self.debug_color_dist = 0.0
         self.in_battle = False
         
-        # Navegação
+        # NAVEGAÇÃO & PROGRESSO (NOVO)
+        self.active_target = None  
+        self.distance_history = [] # Guarda as distâncias dos últimos passos
+        self.failed_directions = []
+        
         self.stuck_counter = 0
         self.map_change_stability_counter = 0
 
         # Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT))
-        pygame.display.set_caption("CEREBRO DO BOT - Visual Sync")
+        pygame.display.set_caption("CEREBRO DO BOT - Anti-Oscillation")
         self.font = pygame.font.SysFont("Consolas", 14, bold=True)
         self.clock = pygame.time.Clock()
         self.running = True
@@ -102,7 +103,6 @@ class FinalFantasyBot:
             pyautogui.keyUp(k)
 
     # --- MEMÓRIA E ESTADOS ---
-    
     def get_current_grid_and_pos(self):
         if self.current_map_mode == "CIDADE":
             return self.town_grid, self.town_x, self.town_y
@@ -113,13 +113,10 @@ class FinalFantasyBot:
         grid, _, _ = self.get_current_grid_and_pos()
         h, w = grid.shape
         if 0 <= x < w and 0 <= y < h:
-            # Só atualiza se o tile ainda não estiver marcado como algo definitivo
-            # Ou sobrescreve unknown com blocked/walkable
             current_val = grid[y, x]
             if current_val == TILE_UNKNOWN:
                 grid[y, x] = state
             elif current_val == TILE_WALKABLE and state == TILE_BLOCKED:
-                # Correção rara: achava que era livre mas bateu
                 grid[y, x] = state
 
     def is_tile_blocked(self, x, y):
@@ -129,7 +126,7 @@ class FinalFantasyBot:
             return grid[y, x] == TILE_BLOCKED
         return True 
 
-    # --- ROTEAMENTO ---
+    # --- ROTEAMENTO INTELIGENTE (COM CHECK DE PROGRESSO) ---
 
     def select_new_target(self):
         if self.current_map_mode == "CIDADE":
@@ -140,8 +137,36 @@ class FinalFantasyBot:
             ty = random.randint(10, self.WORLD_SIZE - 10)
             
         self.active_target = (tx, ty)
-        self.path_fail_count = 0
+        self.failed_directions = [] 
+        self.distance_history = [] # Reseta histórico de progresso
         print(f"🎯 NOVO ALVO: {self.active_target}")
+
+    def check_progress(self, current_dist):
+        """
+        Verifica se estamos avançando ou oscilando.
+        Retorna False se estivermos presos num loop.
+        """
+        self.distance_history.append(current_dist)
+        
+        # Mantém apenas os últimos 5 registros (histórico curto)
+        if len(self.distance_history) > 5:
+            self.distance_history.pop(0)
+            
+        # Só analisa se tivermos pelo menos 3 passos registrados
+        if len(self.distance_history) >= 3:
+            # Compara a distância de 3 passos atrás com a atual
+            # distance_history[0] = Distância há 3 passos (ex: 100px)
+            # distance_history[-1] = Distância agora (ex: 99px)
+            # Progresso = 1px. Isso é muito pouco.
+            
+            progress = self.distance_history[0] - self.distance_history[-1]
+            
+            # Se o progresso for menor que 5 pixels em 3 movimentos -> ESTAGNADO
+            if progress < 5:
+                print(f"⚠️ ESTAGNADO! Progresso: {progress:.1f}px. Trocando alvo.")
+                return False
+                
+        return True
 
     def get_next_routing_step(self):
         if not self.active_target:
@@ -153,13 +178,20 @@ class FinalFantasyBot:
 
         dx = target_x - curr_x
         dy = target_y - curr_y
+        dist_now = math.sqrt(dx**2 + dy**2)
         
-        if math.sqrt(dx**2 + dy**2) < 10:
-            print("✅ CHEGOU! Próximo...")
+        # 1. Checa Chegada
+        if dist_now < 10:
+            print("✅ CHEGOU NO DESTINO!")
             self.select_new_target()
             return None
 
-        # Opções de movimento
+        # 2. Checa Progresso (Anti-Oscilação)
+        if not self.check_progress(dist_now):
+            self.select_new_target()
+            return None
+
+        # 3. Escolha de Movimento
         moves = [
             ('right', curr_x + 1, curr_y),
             ('left',  curr_x - 1, curr_y),
@@ -167,50 +199,55 @@ class FinalFantasyBot:
             ('up',    curr_x,     curr_y - 1)
         ]
         
-        # Heurística: Escolhe o que mais aproxima E não está bloqueado na memória
-        best_move = None
-        min_dist = float('inf')
-
+        # Filtra bloqueados
+        valid_moves = []
         for mv, nx, ny in moves:
-            if not self.is_tile_blocked(nx, ny):
-                dist = math.sqrt((target_x - nx)**2 + (target_y - ny)**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_move = mv
+            if not self.is_tile_blocked(nx, ny) and mv not in self.failed_directions:
+                valid_moves.append((mv, nx, ny))
         
-        if best_move is None:
-            print("⚠️ CAMINHO BLOQUEADO! Resetando Alvo.")
+        if not valid_moves:
+            print("⚠️ BECO SEM SAÍDA. Resetando Alvo.")
             self.select_new_target()
             return None
 
+        # Escolhe o que mais aproxima
+        best_move = None
+        min_dist = float('inf')
+
+        for mv, nx, ny in valid_moves:
+            d = math.sqrt((target_x - nx)**2 + (target_y - ny)**2)
+            if d < min_dist:
+                min_dist = d
+                best_move = mv
+        
         return best_move
 
     # --- VISÃO E COMPARAÇÃO ---
-
     def check_visual_movement(self, img_before, img_after):
-        """Compara dois frames e diz se houve deslocamento de pixels"""
         if img_before is None or img_after is None: return False
         if img_before.shape != img_after.shape: return False
-        
-        # Converte para cinza
         gray1 = cv2.cvtColor(img_before, cv2.COLOR_BGR2GRAY)
         gray2 = cv2.cvtColor(img_after, cv2.COLOR_BGR2GRAY)
-        
-        # Diferença absoluta
         diff = cv2.absdiff(gray1, gray2)
-        
-        # Conta quantos pixels mudaram significativamente (>10 brilho)
-        non_zero_count = np.count_nonzero(diff > 10)
-        
-        # Se mais de 50 pixels mudaram, a tela se moveu
-        return non_zero_count > 50
+        return np.count_nonzero(diff > 10) > 50
 
-    # ... (check_battle_state, handle_battle, visual_signature mantidos) ...
+    # ... (Resto das funções mantidas: find_player, battle, signatures) ...
+    def find_player(self, img):
+        if img is None: return None
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255])) + \
+               cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] != 0: return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+        return (img.shape[1]//2, img.shape[0]//2)
+
     def check_battle_state(self, win_geo):
         rel_x1, rel_y1 = 75, 565
         rel_x2, rel_y2 = 266, 696
-        w = rel_x2 - rel_x1
-        h = rel_y2 - rel_y1
+        w, h = rel_x2 - rel_x1, rel_y2 - rel_y1
         region = {"top": int(win_geo["top"] + rel_y1), "left": int(win_geo["left"] + rel_x1), "width": int(w), "height": int(h)}
         try:
             sct_img = self.sct.grab(region)
@@ -294,7 +331,7 @@ class FinalFantasyBot:
             self.current_map_id = new_id
             self.current_map_signature = new_sig
             self.map_change_stability_counter = 0
-            self.active_target = None 
+            self.select_new_target() # Reseta alvo no mapa novo
             time.sleep(1.0)
             return True
         return False
@@ -303,15 +340,7 @@ class FinalFantasyBot:
         start_x_relative = self.rel_right_x - self.SIZE_BIG
         abs_top = win_geo["top"] + self.rel_y
         abs_left = win_geo["left"] + start_x_relative
-        monitor_idx = 1 if len(self.sct.monitors) > 1 else 0
-        screen_w = self.sct.monitors[monitor_idx]["width"]
-        screen_h = self.sct.monitors[monitor_idx]["height"]
-        if abs_top < 0: abs_top = 0
-        if abs_left < 0: abs_left = 0
         width = self.SIZE_BIG; height = self.SIZE_BIG 
-        if abs_left + width > screen_w: width = screen_w - abs_left
-        if abs_top + height > screen_h: height = screen_h - abs_top
-        if width <= 0 or height <= 0: return None
         region = {"top": int(abs_top), "left": int(abs_left), "width": int(width), "height": int(height)}
         try:
             sct_img = self.sct.grab(region)
@@ -325,6 +354,14 @@ class FinalFantasyBot:
                 return img_bgr
         except: return None
         return None
+
+    def handle_calibration_input(self):
+        keys = pygame.key.get_pressed()
+        speed = 5 if (keys[pygame.K_LSHIFT]) else 1
+        if keys[pygame.K_LEFT]:  self.rel_right_x -= speed
+        if keys[pygame.K_RIGHT]: self.rel_right_x += speed
+        if keys[pygame.K_UP]:    self.rel_y -= speed
+        if keys[pygame.K_DOWN]:  self.rel_y += speed
 
     def detect_dialogue_bubble(self, win_geo):
         cx = win_geo["left"] + (win_geo["width"] // 2) - 200
@@ -344,33 +381,10 @@ class FinalFantasyBot:
         except: pass
         return False
 
-    def find_player(self, img):
-        if img is None: return None
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([0, 150, 100]), np.array([10, 255, 255])) + \
-               cv2.inRange(hsv, np.array([170, 150, 100]), np.array([180, 255, 255]))
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
-        return None
-
-    def handle_calibration_input(self):
-        keys = pygame.key.get_pressed()
-        speed = 5 if (keys[pygame.K_LSHIFT]) else 1
-        if keys[pygame.K_LEFT]:  self.rel_right_x -= speed
-        if keys[pygame.K_RIGHT]: self.rel_right_x += speed
-        if keys[pygame.K_UP]:    self.rel_y -= speed
-        if keys[pygame.K_DOWN]:  self.rel_y += speed
-
     def draw_dashboard(self, minimap, status_text):
         for event in pygame.event.get():
             if event.type == pygame.QUIT: self.running = False
-        
         self.screen.fill(BG_COLOR)
-        
         if minimap is not None:
             rgb = cv2.cvtColor(minimap, cv2.COLOR_BGR2RGB)
             surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
@@ -379,7 +393,6 @@ class FinalFantasyBot:
 
         off_x = 350
         preview_size = 300
-        
         grid_to_draw, px, py = self.get_current_grid_and_pos()
         vis_map = np.zeros((grid_to_draw.shape[0], grid_to_draw.shape[1], 3), dtype=np.uint8)
         vis_map[grid_to_draw == TILE_BLOCKED] = [255, 0, 0] 
@@ -395,20 +408,16 @@ class FinalFantasyBot:
         self.screen.blit(surf_map, (off_x, 80))
         pygame.draw.rect(self.screen, (0, 100, 255), (off_x, 80, preview_size, preview_size), 1)
         
-        header = f"MAPA TÁTICO ({'CIDADE' if self.current_map_mode == 'CIDADE' else 'MUNDI'})"
-        self.screen.blit(self.font.render(header, True, (0, 255, 255)), (off_x, 60))
-
         c = (255, 50, 50) if "COMBATE" in status_text else (0, 255, 0)
         self.screen.blit(self.font.render(f"STATUS: {status_text}", True, c), (20, 20))
         if self.active_target:
-            tgt_text = f"ALVO: {self.active_target} | ERROS: {self.path_fail_count}"
+            tgt_text = f"ALVO: {self.active_target}"
         else: tgt_text = "ALVO: NENHUM"
         self.screen.blit(self.font.render(tgt_text, True, (255, 255, 0)), (20, 480))
-
         pygame.display.flip()
 
     def run(self):
-        print("🎮 BOT RODANDO - Sync Estrito A/B")
+        print("🎮 BOT RODANDO - Anti-Oscilação Ativo")
         while self.running:
             self.handle_calibration_input()
             win = self.get_window_geometry()
@@ -422,7 +431,6 @@ class FinalFantasyBot:
                 self.handle_battle(win)
                 continue
 
-            # Captura Frame A (Antes do movimento)
             minimap_start = self.capture_smart_map(win)
             if minimap_start is None: continue
 
@@ -431,12 +439,9 @@ class FinalFantasyBot:
                 continue
 
             self.current_pos = self.find_player(minimap_start)
-            
-            # Decide movimento com base no mapa tático atual
             next_move = self.get_next_routing_step()
             
             if next_move:
-                # 1. Calcula DESTINO pretendido (Intenção)
                 curr_x, curr_y = self.get_current_grid_and_pos()[1:]
                 intent_x, intent_y = curr_x, curr_y
                 if next_move == 'up': intent_y -= 1
@@ -444,43 +449,27 @@ class FinalFantasyBot:
                 elif next_move == 'left': intent_x -= 1
                 elif next_move == 'right': intent_x += 1
                 
-                # 2. Executa Ação Física
                 pyautogui.keyDown(next_move)
                 time.sleep(0.2) 
                 
-                # 3. Captura Frame B (Depois do movimento)
-                # Precisamos pegar a geometria da janela de novo caso ela tenha movido (alt-tab)
                 win_after = self.get_window_geometry()
-                if not win_after: 
-                    self.release_all_keys()
-                    continue
+                if win_after:
+                    minimap_end = self.capture_smart_map(win_after)
+                    visual_diff = self.check_visual_movement(minimap_start, minimap_end)
                     
-                minimap_end = self.capture_smart_map(win_after)
-                
-                # 4. COMPARAÇÃO FRAME A vs FRAME B
-                visual_diff = self.check_visual_movement(minimap_start, minimap_end)
-                
-                # 5. ATUALIZAÇÃO DA MEMÓRIA
-                if visual_diff:
-                    # Moveu! Atualiza posição interna e marca como Livre
-                    if self.current_map_mode == "CIDADE":
-                        self.town_x, self.town_y = intent_x, intent_y
+                    if visual_diff:
+                        if self.current_map_mode == "CIDADE":
+                            self.town_x, self.town_y = intent_x, intent_y
+                        else:
+                            self.world_x, self.world_y = intent_x, intent_y
+                        self.update_tile_state(intent_x, intent_y, TILE_WALKABLE)
+                        self.stuck_counter = 0
+                        if self.failed_directions: self.failed_directions = []
                     else:
-                        self.world_x, self.world_y = intent_x, intent_y
-                    
-                    self.update_tile_state(intent_x, intent_y, TILE_WALKABLE)
-                    self.stuck_counter = 0
-                else:
-                    # Não Moveu! Marca como Parede
-                    self.update_tile_state(intent_x, intent_y, TILE_BLOCKED)
-                    self.stuck_counter += 1
-                    print(f"🧱 BLOQUEADO: {next_move} em {intent_x},{intent_y}")
-                
-                # Se falhou repetidamente, aumenta o contador global de falha de rota
-                if self.stuck_counter > 0:
-                    self.path_fail_count += 1
-                    if self.path_fail_count > 20: # Se bateu demais
-                        self.select_new_target() # Desiste e troca de alvo
+                        self.update_tile_state(intent_x, intent_y, TILE_BLOCKED)
+                        self.stuck_counter += 1
+                        if next_move not in self.failed_directions:
+                            self.failed_directions.append(next_move)
 
                 pyautogui.keyUp(next_move)
                 self.draw_dashboard(minimap_end, f"INDO: {next_move}")
